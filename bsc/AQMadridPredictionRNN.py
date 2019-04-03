@@ -1,3 +1,7 @@
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 """
 .. module:: WindPrediction
 
@@ -7,13 +11,14 @@ WindPrediction
 :Description: WindPrediction
 
 :Authors: bejar
-    
 
-:Version: 
 
-:Created on: 06/09/2017 9:47 
+:Version:
+
+:Created on: 06/09/2017 9:47
 
 """
+
 
 import numpy as np
 
@@ -21,7 +26,7 @@ from keras.models import Sequential, load_model
 from keras.layers import Dense
 from keras.layers import LSTM, GRU
 from keras.optimizers import RMSprop
-from keras.callbacks import TensorBoard, ModelCheckpoint
+from keras.callbacks import TensorBoard, ModelCheckpoint, EarlyStopping
 from sklearn.metrics import mean_squared_error, r2_score
 import os
 import tensorflow as tf
@@ -35,7 +40,6 @@ import h5py
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 __author__ = 'bejar'
-
 
 def load_config_file(nfile, abspath=False):
     """
@@ -56,101 +60,6 @@ def load_config_file(nfile, abspath=False):
 
     return json.loads(s)
 
-def lagged_vector(data, lag=1, ahead=0):
-    """
-    Returns a vector with columns that are the steps of the lagged time series
-    Last column is the value to predict
-
-    Because arrays start at 0, Ahead starts at 0 but actually means one step ahead
-
-    :param data:
-    :param lag:
-    :return:
-    """
-    lvect = []
-    for i in range(lag):
-        lvect.append(data[i: -lag - ahead + i])
-    lvect.append(data[lag + ahead:])
-
-    return np.stack(lvect, axis=1)
-
-
-def lagged_matrix(data, lag=1, ahead=0):
-    """
-    Returns a matrix with columns that are the steps of the lagged time series
-    Last column is the value to predict
-    :param data:
-    :param lag:
-    :return:
-    """
-    lvect = []
-
-    for i in range(lag):
-        lvect.append(data[i: -lag - ahead + i, :])
-    lvect.append(data[lag + ahead:, :])
-    return np.stack(lvect, axis=1)
-
-
-def _generate_dataset_one_var(data, datasize, testsize, lag=1, ahead=1):
-    """
-    Generates dataset assuming only one variable for prediction
-    Here ahead starts at 1 (I know it is confusing)
-
-    :return:
-    """
-    scaler = StandardScaler()
-    data = scaler.fit_transform(data)
-    # print('DATA Dim =', data.shape)
-
-    wind_train = data[:datasize, :]
-    # print('Train Dim =', wind_train.shape)
-
-    train = lagged_vector(wind_train, lag=lag, ahead=ahead - 1)
-
-    train_x, train_y = train[:, :lag], train[:, -1:, 0]
-
-    wind_test = data[datasize:datasize + testsize, 0].reshape(-1, 1)
-    test = lagged_vector(wind_test, lag=lag, ahead=ahead - 1)
-
-    test_x, test_y = test[:, :lag], test[:, -1:, 0]
-
-    return train_x, train_y, test_x, test_y
-
-
-
-
-def generate_dataset(config, ahead=1, data_path=None):
-    """
-    Generates the dataset for training, test and validation
-
-    :param ahead: number of steps ahead for prediction
-
-    :return:
-    """
-    dataset = config['dataset']
-    datanames = config['datanames']
-    datasize = config['datasize']
-    testsize = config['testsize']
-    vars = config['vars']
-    lag = config['lag']
-
-    airq = {}
-
-    # Reads numpy arrays for all sites and keep only selected columns
-
-    aqdata = np.load(data_path + 'LondonAQ.npz')
-    for d in datanames:
-        airq[d] = aqdata[d]
-        if vars is not None:
-            airq[d] = airq[d][:, vars]
-
-    if dataset == 0:
-        return _generate_dataset_one_var(airq[datanames[0]][:, 0].reshape(-1, 1), datasize, testsize,
-                                         lag=lag, ahead=ahead)
-    # Just add more options to generate datasets with more than one variable for predicting one value
-    # or a sequence of values
-
-    raise NameError('ERROR: No such dataset type')
 
 def rolling_window(a, window):
     shape = a.shape[:-1] + (a.shape[-1] - window + 1, window)
@@ -158,7 +67,7 @@ def rolling_window(a, window):
     return np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)
 
 
-def my_generate_dataset(config, data_path='madrid_dataset/madrid.h5', train_ratio=0.9):
+def my_generate_dataset(config, data_path='madrid_dataset/madrid.h5', val_ratio=0.1, test_ratio=0.1):
     f = h5py.File(data_path, 'r')
     # these are stations
     # stations = list(f.keys())
@@ -168,23 +77,35 @@ def my_generate_dataset(config, data_path='madrid_dataset/madrid.h5', train_rati
     particle = 2
     # values is 1D array with hourly measurement of the particle (2001-2018)
     values = np.array(f[station]['block0_values'][:, particle])
-    # TODO: Improve preprocessing. At the moment just put zeros
-    values[np.isnan(values)] = 0
+    # Impute NaNs with the previous value
+    nan_indices = np.argwhere(np.isnan(values))
+    for i in nan_indices:
+        values[i] = values[i-1]
+
+    # standardize values
+    scaler = StandardScaler()
+    values = scaler.fit_transform(values.reshape(-1, 1)).reshape(-1)
     # windowed_values is an array which is obtained from applying a rolling window of size window_size
     # we will use window_size - 1, and the last one will be the target value
     window_size = config['lag']
     windowed_values = rolling_window(values, window_size)
+    # if lag window is too large we can subsample (once every four)
+    windowed_values = windowed_values[::4]
 
     # train-test split
-    split_point = int(len(windowed_values)*train_ratio)
-    train = windowed_values[:split_point]
-    test = windowed_values[split_point:]
+    test_split_point = int(len(windowed_values)*(1-test_ratio))
+    val_split_point = int(len(windowed_values)*(1-test_ratio-val_ratio))
+    train = windowed_values[:val_split_point]
+    val = windowed_values[val_split_point:test_split_point]
+    test = windowed_values[test_split_point:]
     x_train = train[:, :-1].reshape(-1, window_size-1, 1)
     y_train = train[:, -1].reshape(-1, 1)
+    x_val = val[:, :-1].reshape(-1, window_size-1, 1)
+    y_val = val[:, -1].reshape(-1, 1)
     x_test = test[:, :-1].reshape(-1, window_size-1, 1)
     y_test = test[:, -1].reshape(-1, 1)
 
-    return x_train, y_train, x_test, y_test
+    return x_train, y_train, x_val, y_val, x_test, y_test
 
 
 
@@ -241,10 +162,13 @@ if __name__ == '__main__':
     aq_data_path = './'
 
     #train_x, train_y, test_x, test_y = generate_dataset(config['data'], ahead=ahead, data_path=aq_data_path)
-    train_x, train_y, test_x, test_y = my_generate_dataset(config['data'], data_path='madrid_dataset/madrid.h5', train_ratio=0.9)
+    train_x, train_y, val_x, val_y, test_x, test_y = my_generate_dataset(config['data'],
+                            data_path='madrid_dataset/madrid.h5', test_ratio=0.1, val_ratio=0.1)
 
     print(train_x.shape)
     print(train_y.shape)
+    print(val_x.shape)
+    print(val_y.shape)
     print(test_x.shape)
     print(test_y.shape)
 
@@ -285,22 +209,26 @@ if __name__ == '__main__':
         tensorboard = TensorBoard(log_dir="logs/{}".format(time()))
         cbacks.append(tensorboard)
 
-    if args.best:
-        modfile = './model%d.h5' % int(time())
-        mcheck = ModelCheckpoint(filepath=modfile, monitor='val_loss', verbose=0, save_best_only=True,
+    modfile = './model.h5'
+    modelCheckpoint = ModelCheckpoint(filepath=modfile, monitor='val_loss', verbose=0, save_best_only=True,
                                  save_weights_only=False, mode='auto', period=1)
-        cbacks.append(mcheck)
+    earlyStopping = EarlyStopping(monitor='val_loss', patience=15, verbose=0, mode='min')
+    callbacks = [modelCheckpoint, earlyStopping]
 
-    model.fit(train_x, train_y, batch_size=config['training']['batch'],
+    start_time = time()
+
+    history = model.fit(train_x, train_y, batch_size=config['training']['batch'],
               epochs=config['training']['epochs'],
-              validation_data=(test_x, test_y),
-              verbose=verbose, callbacks=cbacks)
+              validation_data=(val_x, val_y),
+              verbose=True, callbacks=callbacks)
+
+
+    print('Total training time = {0:.2f} seconds'.format(time() - start_time))
 
     ############################################
     # Results
 
-    if args.best:
-        model = load_model(modfile)
+    model = load_model(modfile)
 
     score = model.evaluate(test_x, test_y, batch_size=config['training']['batch'], verbose=0)
 
@@ -313,6 +241,25 @@ if __name__ == '__main__':
     print('R2 test= ', r2test)
     print('R2 test persistence =', r2pers)
 
+    #Loss plot
+    plt.plot(history.history['loss'])
+    plt.plot(history.history['val_loss'])
+    plt.title('model loss')
+    plt.ylabel('loss')
+    plt.xlabel('epoch')
+    plt.legend(['train','val'], loc='upper left')
+    plt.savefig('loss_plot.pdf')
+
+
+"""
+    plt.title('Test results')
+    plt.plot(test_y)
+    plt.plot(test_yp)
+    plt.legend(['true','predicted'], loc='upper left')
+    plt.show()
+"""
+
+"""
     resfile = open('result-%s.txt' % config['data']['datanames'][0], 'a')
     resfile.write('DATAS= %d, LAG= %d, AHEAD= %d, RNN= %s, NLAY= %d, NNEUR= %d, DROP= %3.2f, ACT= %s, RACT= %s, '
                   'OPT= %s, R2Test = %3.5f, R2pers = %3.5f\n' %
@@ -329,7 +276,7 @@ if __name__ == '__main__':
                    r2test, r2pers
                    ))
     resfile.close()
-
+"""
     # Deletes the model file
     #try:
     #    os.remove(modfile)
