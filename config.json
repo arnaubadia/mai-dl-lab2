@@ -1,0 +1,21 @@
+{
+  "data": {
+    "dataset": 0,
+    "lag": 721,
+    "ahead": 1
+  },
+  "arch": {
+    "neurons": 128,
+    "rnn": "GRU",
+    "drop": 0.0,
+    "nlayers": 2,
+    "activation": "tanh",
+    "activation_r": "hard_sigmoid"
+  },
+  "training": {
+    "batch": 500,
+    "epochs": 1000,
+    "optimizer": "adam",
+    "lrate": 0.001
+  }
+}
